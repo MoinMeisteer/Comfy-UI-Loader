@@ -29,6 +29,30 @@ def add_temp_path(folder_type, temp_path):
         print(f"Fehler beim Hinzufügen des temporären Pfads: {str(e)}")
     return False
 
+def is_compatible_comfyui_version():
+    """Prüft, ob die ComfyUI-Version mit dem Plugin kompatibel ist."""
+    try:
+        # Versuche Versionen zu vergleichen, wenn möglich
+        if hasattr(comfy, 'version'):
+            version = getattr(comfy, 'version')
+            if isinstance(version, str):
+                import re
+                match = re.search(r'(\d+)\.(\d+)\.(\d+)', version)
+                if match:
+                    major, minor, patch = map(int, match.groups())
+                    # Angenommen, wir benötigen mindestens Version 1.0.0
+                    return major >= 1
+        
+        # Alternativ prüfe die Existenz von kritischen Funktionen
+        critical_functions = [
+            hasattr(folder_paths, 'get_folder_paths'),
+            hasattr(folder_paths, 'add_folder_paths_to_mem') or hasattr(folder_paths, 'add_path')
+        ]
+        
+        return all(critical_functions)
+    except:
+        return False
+
 class ExternalCheckpointLoader:
     @classmethod
     def INPUT_TYPES(cls):
@@ -629,8 +653,39 @@ class ExternalLoRALoader:
     FUNCTION = "load_lora"
     CATEGORY = "loaders"
 
+    def get_cached_lora(self, lora_name):
+        """Prüft, ob eine LoRA im Cache ist und gibt den Pfad zurück."""
+        if not hasattr(self.__class__, 'cached_models') or not self.__class__.cached_models:
+            return None
+            
+        if lora_name in self.__class__.cached_models:
+            cache_path = self.__class__.cached_models[lora_name]
+            if os.path.exists(cache_path):
+                print(f"LoRA {lora_name} im Cache gefunden: {cache_path}")
+                return cache_path
+        
+        return None
+
     def load_lora(self, lora_name, strength_model, strength_clip, model=None, clip=None, width=512, height=512, batch_size=1):
-        # Wenn keine LoRAs gefunden wurden
+        
+        if not hasattr(self.__class__, 'cache_dir'):
+            self.__class__.setup_lora_cache()
+
+        cache_path = self.get_cached_lora(lora_name)
+        if cache_path:
+            lora_path = cache_path
+            filename = os.path.basename(lora_path)
+            print(f"Verwende zwischengespeicherte LoRA von: {lora_path}")
+        else:
+            drive_path, filename = self.__class__.path_mapping.get(lora_name, (None, None))
+            if not drive_path:
+                raise ValueError(f"LoRA-Pfad für {lora_name} konnte nicht gefunden werden.")
+            
+            lora_path = os.path.join(drive_path, filename)
+        print(f"Lade LoRA von: {lora_path}")
+
+        self.cache_lora(lora_name)
+
         if lora_name == "Keine LoRAs gefunden":
             raise ValueError("Keine LoRAs gefunden. Bitte kopieren Sie LoRA-Modelle in den 'loras'-Ordner auf einem externen Laufwerk.")
         
@@ -638,9 +693,22 @@ class ExternalLoRALoader:
         drive_path, filename = self.__class__.path_mapping.get(lora_name, (None, None))
         if not drive_path:
             raise ValueError(f"LoRA-Pfad für {lora_name} konnte nicht gefunden werden.")
-            
+                
         lora_path = os.path.join(drive_path, filename)
         print(f"Lade LoRA von: {lora_path}")
+        
+        # Prüfe, ob die Datei existiert und lesbar ist
+        if not os.path.exists(lora_path):
+            raise ValueError(f"LoRA-Datei existiert nicht: {lora_path}")
+            
+        # Prüfe die Dateigröße, um offensichtliche Probleme zu erkennen
+        try:
+            file_size = os.path.getsize(lora_path)
+            print(f"LoRA Dateigröße: {file_size/1024/1024:.2f} MB")
+            if file_size < 1000:  # Warnung wenn Datei sehr klein ist
+                print(f"Warnung: LoRA-Datei könnte zu klein sein ({file_size} bytes)")
+        except Exception as e:
+            print(f"Konnte Dateigröße nicht prüfen: {str(e)}")
         
         # Modell und CLIP vorbereiten wenn nicht übergeben
         if model is None or clip is None:
@@ -672,33 +740,41 @@ class ExternalLoRALoader:
                         self.tokenizer = None
                 clip = EmptyCLIP()
         
-        # Verwenden Sie den Standard-LoRA-Loader von ComfyUI
+        # Drei verschiedene Lademethoden nacheinander versuchen
         try:
-            from nodes import LoraLoader
-            loader = LoraLoader()
-            
-            # ALTERNATIVER ANSATZ: Kopiere die Datei temporär in den Standard-LoRAs-Ordner
-            print("Verwende alternative Lademethode für LoRA")
-            
-            # Finde den Standard-LoRA-Ordner
-            lora_dirs = folder_paths.get_folder_paths("loras")
-            if lora_dirs:
-                import shutil, tempfile
-                temp_dir = tempfile.gettempdir()
-                temp_file = os.path.join(temp_dir, filename)
-                
-                # Kopieren der Datei in den temporären Ordner
+            # 1. Methode: Direkte Registrierung des Pfads mit add_temp_path
+            success = add_temp_path("loras", os.path.dirname(lora_path))
+            if success:
                 try:
-                    shutil.copy2(lora_path, temp_file)
-                    print(f"LoRA nach {temp_file} kopiert")
-                    
-                    # Temporär den Pfad zu den bekannten lora-Pfaden hinzufügen
-                    success = add_temp_path("loras", temp_dir)
-                    
-                    if success:
-                        # Die Datei direkt über den Standard-Loader laden
+                    from nodes import LoraLoader
+                    loader = LoraLoader()
+                    print("Versuche direkte LoRA-Pfadregistrierung...")
+                    result = loader.load_lora(os.path.basename(lora_path), strength_model, strength_clip, model, clip)
+                    print("LoRA erfolgreich geladen (Methode 1)")
+                    return result
+                except Exception as e:
+                    print(f"Direktes Laden fehlgeschlagen: {str(e)}")
+                    # Fange den Fehler ab und versuche die nächste Methode
+            
+            # 2. Methode: Kopieren in temporären Ordner
+            import shutil, tempfile
+            temp_dir = tempfile.gettempdir()
+            temp_file = os.path.join(temp_dir, filename)
+            
+            try:
+                shutil.copy2(lora_path, temp_file)
+                print(f"LoRA nach {temp_file} kopiert")
+                
+                # Temporär den Pfad zu den bekannten Lora-Pfaden hinzufügen
+                success = add_temp_path("loras", temp_dir)
+                
+                if success:
+                    try:
+                        from nodes import LoraLoader
+                        loader = LoraLoader()
                         print(f"Lade LoRA aus temporärem Pfad: {filename}")
                         result = loader.load_lora(filename, strength_model, strength_clip, model, clip)
+                        print("LoRA erfolgreich geladen (Methode 2)")
                         
                         # Aufräumen
                         try:
@@ -706,37 +782,40 @@ class ExternalLoRALoader:
                         except:
                             pass
                         
-                        # Rückgabe des Ergebnisses
                         return result
-                    else:
-                        print("Konnte temporären Pfad nicht registrieren")
-                except Exception as e:
-                    print(f"Fehler beim temporären Kopieren: {str(e)}")
-                    try:
+                    except Exception as e:
+                        print(f"Temporäres Laden fehlgeschlagen: {str(e)}")
+                        # Fange den Fehler ab und versuche die nächste Methode
+                else:
+                    print("Konnte temporären Pfad nicht registrieren")
+            except Exception as e:
+                print(f"Fehler beim temporären Kopieren: {str(e)}")
+            finally:
+                # Immer aufräumen
+                try:
+                    if os.path.exists(temp_file):
                         os.remove(temp_file)
-                    except:
-                        pass
+                except:
+                    pass
             
-            # Wenn alles fehlschlägt, versuche es mit direktem Dateisystem-Zugriff
-            print("Versuche direkten Dateisystem-Zugriff")
+            # 3. Methode: Direktes Laden der Datei ohne ComfyUI-API
+            print("Versuche direktes Laden der LoRA-Datei...")
             result = self.load_lora_direct(lora_path, strength_model, strength_clip, model, clip)
             if result:
+                print("LoRA erfolgreich geladen (Methode 3)")
                 return result
             
-            # Fallback
-            print("Verwende leere Modelle als Fallback")
-            return (model, clip)
-                
-        except Exception as e2:
-            print(f"LoRA-Loader konnte nicht initialisiert werden: {str(e2)}")
-            print(f"Verwende ursprüngliche Modelle als Fallback, LoRA konnte nicht geladen werden: {lora_name}")
-            return (model, clip)
+        except Exception as general_e:
+            print(f"Fehler beim Laden der LoRA: {str(general_e)}")
+        
+        # Fallback wenn alle Methoden fehlschlagen
+        print(f"Keine Lademethode erfolgreich, verwende ursprüngliche Modelle für: {lora_name}")
+        return (model, clip)
         
     def load_lora_direct(self, file_path, strength_model, strength_clip, model, clip):
         """Lädt ein LoRA direkt ohne Abhängigkeit von folder_paths."""
         try:
             import torch
-            from safetensors.torch import load_file
             
             print(f"Direktes Laden von LoRA: {file_path}")
             
@@ -747,19 +826,30 @@ class ExternalLoRALoader:
                 
             # Laden der Gewichte direkt aus der Datei
             if file_path.endswith(".safetensors"):
+                from safetensors.torch import load_file
                 lora_state_dict = load_file(file_path)
             else:
                 lora_state_dict = torch.load(file_path, map_location="cpu")
-                
-            # Anwenden auf Modell und CLIP
-            print(f"LoRA Gewichte geladen, Anwenden mit Stärken: {strength_model}, {strength_clip}")
+                    
+            # Versuch, die Gewichte direkt anzuwenden
+            print(f"LoRA Gewichte geladen, Stärken: {strength_model}, {strength_clip}")
             
-            # Vereinfachte Version des LoraLoader-Codes
-            # Hier müssten die Gewichte manuell angewendet werden
-            # Dies ist eine sehr vereinfachte Version und könnte in komplexen Fällen nicht funktionieren
-            
-            print("WARNUNG: Direktes LoRA-Laden ist eine einfache Implementierung")
-            # Da direktes Anwenden komplex ist, geben wir hier nur die Modelle zurück
+            # Suche nach patcher in model oder clip
+            if hasattr(model, 'patcher') and model.patcher is not None:
+                print("Verwende model.patcher für LoRA-Anwendung")
+                try:
+                    model.patcher.patch_model(lora_state_dict, strength_model)
+                except Exception as e:
+                    print(f"Fehler beim Anwenden auf Model: {str(e)}")
+                    
+            if hasattr(clip, 'patcher') and clip.patcher is not None:
+                print("Verwende clip.patcher für LoRA-Anwendung")
+                try:
+                    clip.patcher.patch_model(lora_state_dict, strength_clip)
+                except Exception as e:
+                    print(f"Fehler beim Anwenden auf CLIP: {str(e)}")
+                    
+            print("LoRA direkt angewendet")
             return (model, clip)
         except Exception as e:
             print(f"Fehler beim direkten Laden von LoRA: {str(e)}")
@@ -780,6 +870,10 @@ class ExternalLoRALoader:
         return cache_dir
 
     def cache_lora(self, lora_name):
+        # Stelle sicher, dass das Cache-Verzeichnis existiert
+        if not hasattr(self.__class__, 'cache_dir') or not self.__class__.cache_dir:
+            self.__class__.setup_lora_cache()
+            
         drive_path, filename = self.__class__.path_mapping.get(lora_name, (None, None))
         if not drive_path:
             return False
@@ -789,11 +883,52 @@ class ExternalLoRALoader:
         
         try:
             shutil.copy2(source_path, cache_path)
+            if not hasattr(self.__class__, 'cached_models'):
+                self.__class__.cached_models = {}
             self.__class__.cached_models[lora_name] = cache_path
             return cache_path
         except Exception as e:
             print(f"LoRA-Caching fehlgeschlagen: {e}")
             return False
+        
+class LoRADebugger:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"model": ("MODEL",), "clip": ("CLIP",)}}
+    
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "debug_lora"
+    CATEGORY = "debug"
+    
+    def debug_lora(self, model, clip):
+        result = "LoRA Debug-Informationen:\n\n"
+        
+        # Modell-Informationen
+        result += "MODEL:\n"
+        result += f"- Typ: {type(model)}\n"
+        result += f"- Hat patcher: {hasattr(model, 'patcher')}\n"
+        if hasattr(model, 'patcher') and model.patcher is not None:
+            result += f"- Patcher-Typ: {type(model.patcher)}\n"
+            if hasattr(model.patcher, 'lora_keys'):
+                result += f"- Aktive LoRAs: {model.patcher.lora_keys}\n"
+        
+        # CLIP-Informationen
+        result += "\nCLIP:\n"
+        result += f"- Typ: {type(clip)}\n"
+        result += f"- Hat patcher: {hasattr(clip, 'patcher')}\n"
+        if hasattr(clip, 'patcher') and clip.patcher is not None:
+            result += f"- Patcher-Typ: {type(clip.patcher)}\n"
+            if hasattr(clip.patcher, 'lora_keys'):
+                result += f"- Aktive LoRAs: {clip.patcher.lora_keys}\n"
+        
+        # ComfyUI-Versionsinfos
+        result += "\nCOMFYUI INFOS:\n"
+        if hasattr(comfy, 'version'):
+            result += f"- Version: {comfy.version}\n"
+        
+        result += f"- LoRA-Pfade: {folder_paths.get_folder_paths('loras')}\n"
+        
+        return (result,)
     
 
 NODE_CLASS_MAPPINGS = {
