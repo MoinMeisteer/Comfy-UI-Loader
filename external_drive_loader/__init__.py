@@ -52,6 +52,7 @@ def is_compatible_comfyui_version():
         return all(critical_functions)
     except:
         return False
+    
 
 class ExternalCheckpointLoader:
     @classmethod
@@ -165,13 +166,26 @@ class ExternalCheckpointLoader:
         if ckpt_name == "Keine Modelle gefunden":
             raise ValueError("Keine Modelle gefunden. Bitte kopieren Sie Checkpoints in den 'checkpoints'-Ordner auf einem externen Laufwerk.")
         
-        # Vollständigen Pfad zum Checkpoint aus dem Mapping abrufen
-        drive_path, filename = self.__class__.path_mapping.get(ckpt_name, (None, None))
-        if not drive_path:
-            raise ValueError(f"Modellpfad für {ckpt_name} konnte nicht gefunden werden.")
+        # Stelle sicher dass das Cache-Verzeichnis existiert
+        if not hasattr(self.__class__, 'cache_dir'):
+            self.__class__.setup_model_cache()
+        
+        # Pfad zum Checkpoint-Modell bestimmen (entweder aus Cache oder original)
+        cache_path = self.get_cached_checkpoint(ckpt_name)
+        if cache_path:
+            ckpt_path = cache_path
+            print(f"Verwende zwischengespeicherten Checkpoint: {ckpt_path}")
+        else:
+            # Vollständigen Pfad zum Checkpoint aus dem Mapping abrufen
+            drive_path, filename = self.__class__.path_mapping.get(ckpt_name, (None, None))
+            if not drive_path:
+                raise ValueError(f"Modellpfad für {ckpt_name} konnte nicht gefunden werden.")
+                    
+            ckpt_path = os.path.join(drive_path, filename)
+            print(f"Lade Checkpoint von: {ckpt_path}")
             
-        ckpt_path = os.path.join(drive_path, filename)
-        print(f"Lade Checkpoint von: {ckpt_path}")
+            # Im Hintergrund cachen für zukünftige Verwendung
+            self.cache_checkpoint(ckpt_name)
         
         # Alternative Lademethode
         try:
@@ -240,14 +254,18 @@ class ExternalCheckpointLoader:
         import tempfile
         
         # Cache-Verzeichnis einrichten
-        cache_dir = os.path.join(tempfile.gettempdir(), "comfyui_ext_loader_cache")
+        cache_dir = os.path.join(tempfile.gettempdir(), "comfyui_ext_checkpoint_cache")
         os.makedirs(cache_dir, exist_ok=True)
         cls.cache_dir = cache_dir
         cls.cached_models = {}
         
         return cache_dir
 
-    def cache_model(self, ckpt_name):
+    def cache_checkpoint(self, ckpt_name):
+    # Stelle sicher, dass das Cache-Verzeichnis existiert
+        if not hasattr(self.__class__, 'cache_dir') or not self.__class__.cache_dir:
+            self.__class__.setup_model_cache()
+            
         drive_path, filename = self.__class__.path_mapping.get(ckpt_name, (None, None))
         if not drive_path:
             return False
@@ -256,12 +274,31 @@ class ExternalCheckpointLoader:
         cache_path = os.path.join(self.__class__.cache_dir, filename)
         
         try:
+            # Optional: Asynchrones Kopieren für große Dateien
+            print(f"Kopiere Checkpoint {filename} in den Cache...")
             shutil.copy2(source_path, cache_path)
+            
+            if not hasattr(self.__class__, 'cached_models'):
+                self.__class__.cached_models = {}
             self.__class__.cached_models[ckpt_name] = cache_path
+            print(f"Checkpoint {filename} erfolgreich gecacht")
             return cache_path
         except Exception as e:
-            print(f"Caching fehlgeschlagen: {e}")
+            print(f"Checkpoint-Caching fehlgeschlagen: {e}")
             return False
+        
+    def get_cached_checkpoint(self, ckpt_name):
+        """Prüft, ob ein Checkpoint im Cache ist und gibt den Pfad zurück."""
+        if not hasattr(self.__class__, 'cached_models') or not self.__class__.cached_models:
+            return None
+            
+        if ckpt_name in self.__class__.cached_models:
+            cache_path = self.__class__.cached_models[ckpt_name]
+            if os.path.exists(cache_path):
+                print(f"Checkpoint {ckpt_name} im Cache gefunden: {cache_path}")
+                return cache_path
+        
+        return None
         
 def fix_image_format(tensor):
     """Korrigiert das Format eines Bildtensors für SaveImage"""
@@ -667,149 +704,188 @@ class ExternalLoRALoader:
         return None
 
     def load_lora(self, lora_name, strength_model, strength_clip, model=None, clip=None, width=512, height=512, batch_size=1):
+        """Verbesserte Version der LoRA-Ladefunktion, die konsistente Ergebnisse liefert."""
         
+        # Initialisiere das Cache-System, falls noch nicht geschehen
         if not hasattr(self.__class__, 'cache_dir'):
             self.__class__.setup_lora_cache()
-
-        cache_path = self.get_cached_lora(lora_name)
-        if cache_path:
-            lora_path = cache_path
-            filename = os.path.basename(lora_path)
-            print(f"Verwende zwischengespeicherte LoRA von: {lora_path}")
-        else:
-            drive_path, filename = self.__class__.path_mapping.get(lora_name, (None, None))
-            if not drive_path:
-                raise ValueError(f"LoRA-Pfad für {lora_name} konnte nicht gefunden werden.")
-            
-            lora_path = os.path.join(drive_path, filename)
-        print(f"Lade LoRA von: {lora_path}")
-
-        self.cache_lora(lora_name)
-
+        
+        # Prüfe auf leere Auswahl
         if lora_name == "Keine LoRAs gefunden":
             raise ValueError("Keine LoRAs gefunden. Bitte kopieren Sie LoRA-Modelle in den 'loras'-Ordner auf einem externen Laufwerk.")
         
-        # Vollständigen Pfad zum LoRA aus dem Mapping abrufen
-        drive_path, filename = self.__class__.path_mapping.get(lora_name, (None, None))
-        if not drive_path:
-            raise ValueError(f"LoRA-Pfad für {lora_name} konnte nicht gefunden werden.")
-                
-        lora_path = os.path.join(drive_path, filename)
-        print(f"Lade LoRA von: {lora_path}")
+        # Bestimme den Dateipfad (entweder aus Cache oder vom externen Laufwerk)
+        cache_path = self.get_cached_lora(lora_name)
+        if cache_path and os.path.exists(cache_path):
+            lora_path = cache_path
+            filename = os.path.basename(lora_path)
+            print(f"Verwende zwischengespeicherte LoRA: {lora_path}")
+        else:
+            # Wenn nicht im Cache, verwende das Original
+            drive_path, filename = self.__class__.path_mapping.get(lora_name, (None, None))
+            if not drive_path:
+                raise ValueError(f"LoRA-Pfad für {lora_name} konnte nicht gefunden werden.")
+                    
+            lora_path = os.path.join(drive_path, filename)
+            print(f"Lade LoRA von externem Laufwerk: {lora_path}")
+            
+            # Im Hintergrund cachen für zukünftige Verwendung
+            try:
+                self.cache_lora(lora_name)
+            except Exception as e:
+                print(f"Caching für zukünftige Verwendung fehlgeschlagen: {e}")
         
-        # Prüfe, ob die Datei existiert und lesbar ist
+        # Prüfe, ob die Datei existiert
         if not os.path.exists(lora_path):
             raise ValueError(f"LoRA-Datei existiert nicht: {lora_path}")
-            
-        # Prüfe die Dateigröße, um offensichtliche Probleme zu erkennen
+        
+        # Prüfe Dateigröße
         try:
             file_size = os.path.getsize(lora_path)
             print(f"LoRA Dateigröße: {file_size/1024/1024:.2f} MB")
-            if file_size < 1000:  # Warnung wenn Datei sehr klein ist
+            if file_size < 1000:
                 print(f"Warnung: LoRA-Datei könnte zu klein sein ({file_size} bytes)")
         except Exception as e:
             print(f"Konnte Dateigröße nicht prüfen: {str(e)}")
         
-        # Modell und CLIP vorbereiten wenn nicht übergeben
+        # Erstelle leere Modelle falls nötig
         if model is None or clip is None:
             import torch
+            from comfy import model_management
             
-            # Erstelle direkt eigene Dummy-Objekte
             if model is None:
-                print("Erstelle eigenes Ersatz-Modell")
-                class EmptyModel:
-                    def __init__(self):
-                        self.model = torch.nn.Module()
-                        self.model_config = {
-                            "model": {"target": "ldm.models.diffusion.ddpm.LatentDiffusion"}, 
-                            "image_size": [height, width]
-                        }
-                        self.is_empty = True
-                        self.model_name = "empty_model"
-                        self.model_type = None
-                model = EmptyModel()
+                try:
+                    # Versuche ein leeres base-Modell zu laden
+                    from comfy import sd
+                    if hasattr(sd, 'load_model_weights_empty'):
+                        model = sd.load_model_weights_empty(width, height, 1)
+                        print("Leeres Modell mit ComfyUI-API erstellt")
+                    else:
+                        # Fallback auf eigene Implementierung
+                        class EmptyModel:
+                            def __init__(self):
+                                self.model = torch.nn.Module()
+                                self.model_config = {
+                                    "model": {"target": "ldm.models.diffusion.ddpm.LatentDiffusion"}, 
+                                    "image_size": [height, width]
+                                }
+                                self.is_empty = True
+                                self.model_name = "empty_model"
+                                self.model_type = None
+                        model = EmptyModel()
+                        print("Leeres Modell mit eigener Implementierung erstellt")
+                except Exception as e:
+                    print(f"Fehler beim Erstellen des leeren Modells: {str(e)}")
+                    # Minimalistisches Fallback-Modell
+                    class MinimalModel:
+                        def __init__(self): self.model = torch.nn.Module()
+                    model = MinimalModel()
             
             if clip is None:
-                print("Erstelle eigenen Ersatz-CLIP")
-                class EmptyCLIP:
-                    def __init__(self):
-                        self.cond_stage_model = torch.nn.Module()
-                        self.clip_layer = "last"
-                        self.is_empty = True
-                        self.patcher = None
-                        self.tokenizer = None
-                clip = EmptyCLIP()
-        
-        # Drei verschiedene Lademethoden nacheinander versuchen
-        try:
-            # 1. Methode: Direkte Registrierung des Pfads mit add_temp_path
-            success = add_temp_path("loras", os.path.dirname(lora_path))
-            if success:
                 try:
-                    from nodes import LoraLoader
-                    loader = LoraLoader()
-                    print("Versuche direkte LoRA-Pfadregistrierung...")
-                    result = loader.load_lora(os.path.basename(lora_path), strength_model, strength_clip, model, clip)
-                    print("LoRA erfolgreich geladen (Methode 1)")
-                    return result
+                    # Versuche einen leeren CLIP zu laden
+                    from comfy import sd
+                    if hasattr(sd, 'load_clip_weights_empty'):
+                        clip = sd.load_clip_weights_empty(width, height, batch_size)
+                        print("Leerer CLIP mit ComfyUI-API erstellt")
+                    else:
+                        # Fallback auf eigene Implementierung
+                        class EmptyCLIP:
+                            def __init__(self):
+                                self.cond_stage_model = torch.nn.Module()
+                                self.clip_layer = "last"
+                                self.is_empty = True
+                                self.patcher = None
+                                self.tokenizer = None
+                        clip = EmptyCLIP()
+                        print("Leerer CLIP mit eigener Implementierung erstellt")
                 except Exception as e:
-                    print(f"Direktes Laden fehlgeschlagen: {str(e)}")
-                    # Fange den Fehler ab und versuche die nächste Methode
-            
-            # 2. Methode: Kopieren in temporären Ordner
-            import shutil, tempfile
-            temp_dir = tempfile.gettempdir()
-            temp_file = os.path.join(temp_dir, filename)
-            
-            try:
-                shutil.copy2(lora_path, temp_file)
-                print(f"LoRA nach {temp_file} kopiert")
-                
-                # Temporär den Pfad zu den bekannten Lora-Pfaden hinzufügen
-                success = add_temp_path("loras", temp_dir)
-                
-                if success:
-                    try:
-                        from nodes import LoraLoader
-                        loader = LoraLoader()
-                        print(f"Lade LoRA aus temporärem Pfad: {filename}")
-                        result = loader.load_lora(filename, strength_model, strength_clip, model, clip)
-                        print("LoRA erfolgreich geladen (Methode 2)")
-                        
-                        # Aufräumen
-                        try:
-                            os.remove(temp_file)
-                        except:
-                            pass
-                        
-                        return result
-                    except Exception as e:
-                        print(f"Temporäres Laden fehlgeschlagen: {str(e)}")
-                        # Fange den Fehler ab und versuche die nächste Methode
-                else:
-                    print("Konnte temporären Pfad nicht registrieren")
-            except Exception as e:
-                print(f"Fehler beim temporären Kopieren: {str(e)}")
-            finally:
-                # Immer aufräumen
-                try:
-                    if os.path.exists(temp_file):
-                        os.remove(temp_file)
-                except:
-                    pass
-            
-            # 3. Methode: Direktes Laden der Datei ohne ComfyUI-API
-            print("Versuche direktes Laden der LoRA-Datei...")
-            result = self.load_lora_direct(lora_path, strength_model, strength_clip, model, clip)
-            if result:
-                print("LoRA erfolgreich geladen (Methode 3)")
-                return result
-            
-        except Exception as general_e:
-            print(f"Fehler beim Laden der LoRA: {str(general_e)}")
+                    print(f"Fehler beim Erstellen des leeren CLIPs: {str(e)}")
+                    # Minimalistisches Fallback-CLIP
+                    class MinimalCLIP:
+                        def __init__(self): self.cond_stage_model = torch.nn.Module()
+                    clip = MinimalCLIP()
         
-        # Fallback wenn alle Methoden fehlschlagen
-        print(f"Keine Lademethode erfolgreich, verwende ursprüngliche Modelle für: {lora_name}")
+        # WICHTIG: Verwende den Standard-LoRA-Loader direkt
+        try:
+            # Importiere den Standard-LoRA-Loader
+            from nodes import LoraLoader
+            loader = LoraLoader()
+            
+            # Methode 1: Lora-Ordner temporär hinzufügen
+            lora_dir = os.path.dirname(lora_path)
+            orig_paths = folder_paths.get_folder_paths("loras")
+            
+            success = False
+            try:
+                # Versuche den temporären Pfad hinzuzufügen
+                if add_temp_path("loras", lora_dir):
+                    # Rufe den Standard-Loader mit dem Dateinamen auf
+                    print(f"Rufe Standard-LoraLoader.load_lora mit Dateinamen: {filename} auf")
+                    print(f"Strength Model: {strength_model}, Strength CLIP: {strength_clip}")
+                    result = loader.load_lora(filename, strength_model, strength_clip, model, clip)
+                    success = True
+                    return result
+            except Exception as e1:
+                print(f"Fehler bei Methode 1: {str(e1)}")
+            
+            # Methode 2: Kopieren in temporären Ordner im standard loras folder
+            if not success:
+                try:
+                    default_lora_paths = folder_paths.get_folder_paths("loras")
+                    if default_lora_paths:
+                        default_lora_dir = default_lora_paths[0]
+                        temp_file = os.path.join(default_lora_dir, f"temp_{filename}")
+                        
+                        # Kopiere die Datei temporär
+                        print(f"Kopiere LoRA nach: {temp_file}")
+                        shutil.copy2(lora_path, temp_file)
+                        
+                        try:
+                            # Lade die LoRA mit dem Standard-Loader
+                            print(f"Lade LoRA aus Standard-Ordner: {os.path.basename(temp_file)}")
+                            result = loader.load_lora(os.path.basename(temp_file), strength_model, strength_clip, model, clip)
+                            
+                            # Lösche die temporäre Datei
+                            if os.path.exists(temp_file):
+                                os.remove(temp_file)
+                            
+                            return result
+                        except Exception as e2:
+                            print(f"Fehler beim Laden aus Standard-Ordner: {str(e2)}")
+                            # Lösche die temporäre Datei bei Fehler
+                            if os.path.exists(temp_file):
+                                os.remove(temp_file)
+                except Exception as e3:
+                    print(f"Fehler bei Methode 2: {str(e3)}")
+            
+            # Methode 3: Direktes Laden mit safetensors oder torch
+            print("Versuche LoRA direkt zu laden...")
+            try:
+                from safetensors.torch import load_file
+                import torch
+                from comfy.utils import load_torch_file
+                
+                print(f"Lade LoRA-Gewichte aus: {lora_path}")
+                if lora_path.endswith(".safetensors"):
+                    lora_state_dict = load_file(lora_path)
+                else:
+                    lora_state_dict = load_torch_file(lora_path)
+                
+                from comfy import lora
+                
+                # Dies verwendet die interne ComfyUI-LoRA-Funktionalität
+                print(f"Wende LoRA mit der offziellen API an: Stärken {strength_model}, {strength_clip}")
+                model_lora, clip_lora = lora.load_lora(model, clip, lora_state_dict, strength_model, strength_clip)
+                return (model_lora, clip_lora)
+            except Exception as e4:
+                print(f"Alle Lademethoden fehlgeschlagen: {str(e4)}")
+                
+        except Exception as e_outer:
+            print(f"Fehler im LoRA-Ladevorgang: {str(e_outer)}")
+        
+        # Letzter Ausweg: Gib die unveränderten Modelle zurück
+        print("Verwende Originalmodelle, da LoRA nicht geladen werden konnte")
         return (model, clip)
         
     def load_lora_direct(self, file_path, strength_model, strength_clip, model, clip):
