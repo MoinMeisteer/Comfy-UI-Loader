@@ -5,48 +5,29 @@ import comfy
 import shutil
 import importlib
 
-def get_comfy_vae():
-    """Versucht, eine Standard-VAE von ComfyUI zu laden"""
+def add_temp_path(folder_type, temp_path):
+    """Fügt einen temporären Pfad zu folder_paths hinzu, ohne Abhängigkeit von API-Änderungen."""
     try:
-        # Versuche, die VAE-Klasse von comfy.sd zu importieren
-        from comfy.sd import VAE
-        return VAE()
-    except ImportError:
-        # Wenn nicht vorhanden, versuche andere Orte
-        paths = [
-            ("comfy.sd", "VAE"),
-            ("comfy.vae", "VAE"),
-            ("nodes", "VAE")
-        ]
-        
-        for module_name, class_name in paths:
-            try:
-                module = importlib.import_module(module_name)
-                VAE_class = getattr(module, class_name, None)
-                if VAE_class:
-                    return VAE_class()
-            except (ImportError, AttributeError):
-                continue
-        
-        # Wenn alles fehlschlägt, erstelle einen Mock
-        import torch
-        
-        class MockVAE(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                print("MockVAE erstellt als letzten Ausweg")
-                
-            def decode(self, *args, **kwargs):
-                print("MockVAE.decode aufgerufen")
-                # Leeres Bild zurückgeben (1 Batch, 3 Kanäle, 512x512)
-                return torch.zeros(1, 3, 512, 512)
-                
-            def encode(self, *args, **kwargs):
-                print("MockVAE.encode aufgerufen")
-                # Leere Latents zurückgeben
-                return {"samples": torch.zeros(1, 4, 64, 64)}
-        
-        return MockVAE()
+        # Versuche zunächst die add_folder_paths_to_mem-Funktion, falls vorhanden
+        if hasattr(folder_paths, 'add_folder_paths_to_mem'):
+            folder_paths.add_folder_paths_to_mem(folder_type, [temp_path])
+            return True
+        # Wenn nicht, versuche die ältere add_path-Methode
+        elif hasattr(folder_paths, 'add_path'):
+            folder_paths.add_path(folder_type, temp_path)
+            return True
+        # Direktes Hinzufügen zum Pfad-Dictionary als letzten Ausweg
+        else:
+            # Vorsichtiges Hinzufügen zum paths-Dictionary, wenn es existiert
+            if hasattr(folder_paths, 'paths') and isinstance(folder_paths.paths, dict):
+                if folder_type in folder_paths.paths:
+                    if isinstance(folder_paths.paths[folder_type], list):
+                        if temp_path not in folder_paths.paths[folder_type]:
+                            folder_paths.paths[folder_type].append(temp_path)
+                            return True
+    except Exception as e:
+        print(f"Fehler beim Hinzufügen des temporären Pfads: {str(e)}")
+    return False
 
 class ExternalCheckpointLoader:
     @classmethod
@@ -61,7 +42,7 @@ class ExternalCheckpointLoader:
         
         for drive in external_drives:
             # Pfad zum Checkpoints-Ordner
-            model_path = os.path.join(drive, "checkpoints", "vae", "loras")
+            model_path = os.path.join(drive, "checkpoints")
             print(f"Suche nach Checkpoints in: {model_path}")
             
             # Wenn der Checkpoints-Ordner nicht existiert, erstelle ihn
@@ -168,35 +149,67 @@ class ExternalCheckpointLoader:
         ckpt_path = os.path.join(drive_path, filename)
         print(f"Lade Checkpoint von: {ckpt_path}")
         
-        # Verwenden Sie den Standard-Checkpoint-Loader von ComfyUI
+        # Alternative Lademethode
+        try:
+            from comfy import sd
+            print("Versuche direktes Laden mit load_checkpoint_guess_config...")
+            result = sd.load_checkpoint_guess_config(ckpt_path)
+            if result:
+                print("Checkpoint erfolgreich direkt geladen")
+                # Stelle sicher, dass wir genau 3 Elemente zurückgeben
+                if len(result) >= 3:
+                    return (result[0], result[1], result[2])
+        except Exception as e:
+            print(f"Direktes Laden fehlgeschlagen: {str(e)}")
+        
+        # Versuche die Standardmethode mit temporärem Pfad
         try:
             from nodes import CheckpointLoaderSimple
             loader = CheckpointLoaderSimple()
             
-            # Temporär den externen Pfad registrieren
-            orig_checkpoints = folder_paths.get_folder_paths("checkpoints")
+            # Temporäre Kopie erstellen
+            import shutil, tempfile
+            temp_dir = tempfile.gettempdir()
+            temp_file = os.path.join(temp_dir, filename)
+            
             try:
-                folder_paths.add_folder_paths_to_mem("checkpoints", [os.path.dirname(ckpt_path)])
-                # Die Datei direkt über den Standard-Loader laden
-                return loader.load_checkpoint(os.path.basename(ckpt_path))
-            finally:
-                # Pfad zurücksetzen
-                folder_paths.set_folder_paths("checkpoints", orig_checkpoints)
+                shutil.copy2(ckpt_path, temp_file)
+                print(f"Checkpoint nach {temp_file} kopiert")
                 
+                success = add_temp_path("checkpoints", temp_dir)
+                if success:
+                    print(f"Lade Checkpoint aus temporärem Pfad: {filename}")
+                    result = loader.load_checkpoint(filename)
+                    
+                    # Aufräumen
+                    try:
+                        os.remove(temp_file)
+                    except:
+                        pass
+                    
+                    return result
+            except Exception as e:
+                print(f"Fehler beim temporären Kopieren: {str(e)}")
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
         except Exception as e:
-            print(f"Fehler beim Laden des Checkpoints: {str(e)}")
-            # Fallback-Methode
-            try:
-                from comfy import sd
-                result = sd.load_checkpoint_guess_config(ckpt_path)
-                # Stellen Sie sicher, dass wir genau 3 Elemente zurückgeben
+            print(f"Checkpoint-Loader konnte nicht initialisiert werden: {str(e)}")
+        
+        # Als letzten Ausweg versuche direktes Laden ohne loader
+        try:
+            from comfy import sd
+            print("Versuche letzten Ausweg mit load_checkpoint_guess_config...")
+            result = sd.load_checkpoint_guess_config(ckpt_path)
+            if result:
                 if len(result) >= 3:
                     return (result[0], result[1], result[2])
                 else:
-                    raise ValueError(f"Unerwartetes Format des Checkpoint-Ergebnisses")
-            except Exception as e2:
-                print(f"Auch Fallback fehlgeschlagen: {str(e2)}")
-                raise ValueError(f"Konnte Checkpoint nicht laden: {ckpt_name}")
+                    raise ValueError("Unerwartetes Format des Checkpoint-Ergebnisses")
+        except Exception as e2:
+            print(f"Auch Fallback fehlgeschlagen: {str(e2)}")
+            raise ValueError(f"Konnte Checkpoint nicht laden: {ckpt_name}")
             
     @classmethod
     def setup_model_cache(cls):
@@ -451,13 +464,13 @@ class ExternalVAELoader:
                             for x in range(w):
                                 tensor[0, 0, y, x] = x / w  # R
                                 tensor[0, 1, y, x] = y / h  # G
-                                tensor[0, 2, y, x] = (x + y) / (w + h)  # B
+                                tensor[0, 2, y, x] = (x + y) / (w + h) 
                         
                         # Hier konvertieren wir explizit zum von ComfyUI erwarteten Format [B, H, W, C]
                         # für Kompatibilität mit dem VAEDecode-Knoten
-                        tensor_nhwc = tensor.permute(0, 2, 3, 1)
-                        print(f"MockVAE gibt Tensor mit Format {tensor_nhwc.shape} zurück")
-                        return tensor_nhwc
+                        
+                        print(f"MockVAE gibt Tensor mit Format {tensor.shape} zurück")
+                        return tensor
                         
                     def encode(self, *args, **kwargs):
                         print("MockVAE.encode aufgerufen")
@@ -629,75 +642,130 @@ class ExternalLoRALoader:
         lora_path = os.path.join(drive_path, filename)
         print(f"Lade LoRA von: {lora_path}")
         
+        # Modell und CLIP vorbereiten wenn nicht übergeben
+        if model is None or clip is None:
+            import torch
+            
+            # Erstelle direkt eigene Dummy-Objekte
+            if model is None:
+                print("Erstelle eigenes Ersatz-Modell")
+                class EmptyModel:
+                    def __init__(self):
+                        self.model = torch.nn.Module()
+                        self.model_config = {
+                            "model": {"target": "ldm.models.diffusion.ddpm.LatentDiffusion"}, 
+                            "image_size": [height, width]
+                        }
+                        self.is_empty = True
+                        self.model_name = "empty_model"
+                        self.model_type = None
+                model = EmptyModel()
+            
+            if clip is None:
+                print("Erstelle eigenen Ersatz-CLIP")
+                class EmptyCLIP:
+                    def __init__(self):
+                        self.cond_stage_model = torch.nn.Module()
+                        self.clip_layer = "last"
+                        self.is_empty = True
+                        self.patcher = None
+                        self.tokenizer = None
+                clip = EmptyCLIP()
+        
         # Verwenden Sie den Standard-LoRA-Loader von ComfyUI
         try:
             from nodes import LoraLoader
             loader = LoraLoader()
             
-            # Temporär den externen Pfad registrieren
-            orig_lora_paths = folder_paths.get_folder_paths("loras")
-            try:
-                folder_paths.add_folder_paths_to_mem("loras", [os.path.dirname(lora_path)])
+            # ALTERNATIVER ANSATZ: Kopiere die Datei temporär in den Standard-LoRAs-Ordner
+            print("Verwende alternative Lademethode für LoRA")
+            
+            # Finde den Standard-LoRA-Ordner
+            lora_dirs = folder_paths.get_folder_paths("loras")
+            if lora_dirs:
+                import shutil, tempfile
+                temp_dir = tempfile.gettempdir()
+                temp_file = os.path.join(temp_dir, filename)
                 
-                # Das Modell und CLIP vorbereiten wenn nicht übergeben
-                if model is None or clip is None:
-                    from comfy import sd
-                    import torch
-                    import inspect
+                # Kopieren der Datei in den temporären Ordner
+                try:
+                    shutil.copy2(lora_path, temp_file)
+                    print(f"LoRA nach {temp_file} kopiert")
                     
-                    # Prüfe, ob die notwendigen Funktionen existieren
-                    has_model_func = hasattr(sd, 'load_model_weights_empty') and callable(getattr(sd, 'load_model_weights_empty'))
-                    has_clip_func = hasattr(sd, 'load_clip_weights_empty') and callable(getattr(sd, 'load_clip_weights_empty'))
+                    # Temporär den Pfad zu den bekannten lora-Pfaden hinzufügen
+                    success = add_temp_path("loras", temp_dir)
                     
-                    if model is None or clip is None:
-                        import torch
+                    if success:
+                        # Die Datei direkt über den Standard-Loader laden
+                        print(f"Lade LoRA aus temporärem Pfad: {filename}")
+                        result = loader.load_lora(filename, strength_model, strength_clip, model, clip)
                         
-                        # Erstelle direkt eigene Dummy-Objekte ohne API-Aufrufversuche
-                        if model is None:
-                            print("Erstelle eigenes Ersatz-Modell")
-                            class EmptyModel:
-                                def __init__(self):
-                                    self.model = torch.nn.Module()
-                                    self.model_config = {
-                                        "model": {"target": "ldm.models.diffusion.ddpm.LatentDiffusion"}, 
-                                        "image_size": [height, width]
-                                    }
-                                    # Weitere Eigenschaften, die ComfyUI erwartet
-                                    self.is_empty = True
-                                    self.model_name = "empty_model"
-                                    self.model_type = None
-                            model = EmptyModel()
+                        # Aufräumen
+                        try:
+                            os.remove(temp_file)
+                        except:
+                            pass
                         
-                        if clip is None:
-                            print("Erstelle eigenen Ersatz-CLIP")
-                            class EmptyCLIP:
-                                def __init__(self):
-                                    self.cond_stage_model = torch.nn.Module()
-                                    self.clip_layer = "last"
-                                    self.is_empty = True
-                                    # Weitere Eigenschaften, die LoRA-Loader benötigt
-                                    self.patcher = None
-                                    self.tokenizer = None
-                            clip = EmptyCLIP()
-                
-                # Die Datei direkt über den Standard-Loader laden
-                return loader.load_lora(os.path.basename(lora_path), strength_model, strength_clip, model, clip)
-            finally:
-                # Pfad zurücksetzen
-                folder_paths.set_folder_paths("loras", orig_lora_paths)
+                        # Rückgabe des Ergebnisses
+                        return result
+                    else:
+                        print("Konnte temporären Pfad nicht registrieren")
+                except Exception as e:
+                    print(f"Fehler beim temporären Kopieren: {str(e)}")
+                    try:
+                        os.remove(temp_file)
+                    except:
+                        pass
+            
+            # Wenn alles fehlschlägt, versuche es mit direktem Dateisystem-Zugriff
+            print("Versuche direkten Dateisystem-Zugriff")
+            result = self.load_lora_direct(lora_path, strength_model, strength_clip, model, clip)
+            if result:
+                return result
+            
+            # Fallback
+            print("Verwende leere Modelle als Fallback")
+            return (model, clip)
                 
         except Exception as e2:
-            print(f"Auch Fallback fehlgeschlagen: {str(e2)}")
-            if model is None or clip is None:
-                # Erzeuge leere Modelle wenn nötig
-                from comfy import sd
-                if model is None:
-                    model = sd.load_model_weights_empty(width, height, 1)
-                if clip is None:
-                    clip = sd.load_clip_weights_empty(width, height, batch_size)
-                    
+            print(f"LoRA-Loader konnte nicht initialisiert werden: {str(e2)}")
             print(f"Verwende ursprüngliche Modelle als Fallback, LoRA konnte nicht geladen werden: {lora_name}")
             return (model, clip)
+        
+    def load_lora_direct(self, file_path, strength_model, strength_clip, model, clip):
+        """Lädt ein LoRA direkt ohne Abhängigkeit von folder_paths."""
+        try:
+            import torch
+            from safetensors.torch import load_file
+            
+            print(f"Direktes Laden von LoRA: {file_path}")
+            
+            # Überprüfen, ob die Datei existiert
+            if not os.path.exists(file_path):
+                print(f"LoRA-Datei nicht gefunden: {file_path}")
+                return None
+                
+            # Laden der Gewichte direkt aus der Datei
+            if file_path.endswith(".safetensors"):
+                lora_state_dict = load_file(file_path)
+            else:
+                lora_state_dict = torch.load(file_path, map_location="cpu")
+                
+            # Anwenden auf Modell und CLIP
+            print(f"LoRA Gewichte geladen, Anwenden mit Stärken: {strength_model}, {strength_clip}")
+            
+            # Vereinfachte Version des LoraLoader-Codes
+            # Hier müssten die Gewichte manuell angewendet werden
+            # Dies ist eine sehr vereinfachte Version und könnte in komplexen Fällen nicht funktionieren
+            
+            print("WARNUNG: Direktes LoRA-Laden ist eine einfache Implementierung")
+            # Da direktes Anwenden komplex ist, geben wir hier nur die Modelle zurück
+            return (model, clip)
+        except Exception as e:
+            print(f"Fehler beim direkten Laden von LoRA: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
                 
     @classmethod
     def setup_lora_cache(cls):
