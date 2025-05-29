@@ -41,48 +41,60 @@ class ExternalCheckpointLoader:
             except (PermissionError, FileNotFoundError) as e:
                 print(f"Fehler beim Lesen von {model_path}: {str(e)}")
         
+        # Vorbereiten der Beschriftungen für die UI
+        if drives_without_folders:
+            missing_drives = ", ".join(drives_without_folders)
+            drives_without_folders_text = f"Auf folgenden Laufwerken fehlt der 'checkpoints' Ordner: {missing_drives}"
+        else:
+            drives_without_folders_text = ""
+        
         # Ergebnisse für die UI vorbereiten
         if all_ckpt_files:
+            # Es wurden Modelle gefunden
             ckpt_names = [f"{os.path.basename(os.path.dirname(d))} - {f}" for d, f in all_ckpt_files]
+            
+            # Erstelle Info-Text mit fehlenden Ordnern
+            drive_info = []
+            for drive in drives_with_models:
+                if "(leer)" in drive:
+                    drive_info.append(f"{drive.split(' (leer)')[0]} (Ordner leer)")
+                else:
+                    drive_info.append(drive)
+                    
+            info_text = f"Laufwerke mit Modellen: {', '.join(drive_info)}"
+            if drives_without_folders_text:
+                info_text += f"\n\n{drives_without_folders_text}"
         else:
-            # Erstelle eine informativere "Keine Modelle gefunden" Meldung
-            missing_folders_info = ""
+            # Keine Modelle gefunden - zeige klare Anleitung
             if drives_without_folders:
-                missing_drives = ", ".join(drives_without_folders)
-                missing_folders_info = f" (Erstellen Sie 'checkpoints'-Ordner auf: {missing_drives})"
-            ckpt_names = [f"Keine Modelle gefunden{missing_folders_info}"]
+                # Es gibt Laufwerke ohne checkpoints Ordner
+                ckpt_names = ["Bitte Modelle in 'checkpoints' Ordner kopieren"]
+                info_text = f"Keine Modelle gefunden.\n\n{drives_without_folders_text}\n\nBitte erstellen Sie einen 'checkpoints' Ordner und kopieren Sie dort Ihre Modelle hinein."
+            else:
+                # Es gibt Laufwerke mit leeren checkpoints Ordnern
+                ckpt_names = ["Bitte Modelle in 'checkpoints' Ordner kopieren"]
+                info_text = "Keine Modelle gefunden. Bitte kopieren Sie Modelle in den vorhandenen 'checkpoints' Ordner."
         
         # Speichern der Pfad-Informationen zur späteren Verwendung
         cls.path_mapping = dict(zip(ckpt_names, all_ckpt_files)) if all_ckpt_files else {}
         
-        # Füge Informationen für die UI hinzu
-        drive_info = []
-        for drive in drives_with_models:
-            if "(leer)" in drive:
-                drive_info.append(f"{drive.split(' (leer)')[0]} (Ordner leer)")
-            else:
-                drive_info.append(drive)
-        
-        # Erstelle Info-Text mit fehlenden Ordnern
-        info_text = f"Laufwerke: {', '.join(drive_info) if drive_info else 'Keine'}"
-        if drives_without_folders:
-            info_text += f"\nFehlende 'checkpoints'-Ordner auf: {', '.join(drives_without_folders)}"
-        
-        if drives_without_folders:
-            return {
-                "required": {
-                    "ckpt_name": (ckpt_names, {"info": info_text}),
-                },
-                "optional": {
-                    "create_folders": ("BOOLEAN", {"default": False, "label": "Checkpoints-Ordner erstellen"})
-                }
+        # UI-Erstellung mit Button zum Ordner erstellen
+        ui_dict = {
+            "required": {
+                "ckpt_name": (ckpt_names, {"info": info_text})
             }
-        else:
-            return {
-                "required": {
-                    "ckpt_name": (ckpt_names, {"info": info_text})
-                }
+        }
+        
+        # Füge Button zum Erstellen des Ordners hinzu, aber nur wenn es fehlende Ordner gibt
+        if drives_without_folders:
+            ui_dict["optional"] = {
+                "create_checkpoints_folder": ("BOOLEAN", {
+                    "default": False, 
+                    "label": "Checkpoints-Ordner erstellen"
+                })
             }
+        
+        return ui_dict
     
     @staticmethod
     def find_external_drives():
@@ -122,11 +134,11 @@ class ExternalCheckpointLoader:
     FUNCTION = "load_ckpt"
     CATEGORY = "loaders"
 
-    def load_ckpt(self, ckpt_name, create_folders=False):
+    def load_ckpt(self, ckpt_name, create_folders=False, create_checkpoints_folder=False):
         """Lädt einen Checkpoint von einem externen Laufwerk."""
         
         # Wenn keine Modelle gefunden wurden aber der Button gedrückt wurde
-        if "Keine Modelle gefunden" in ckpt_name and create_folders == True:  # Expliziter Vergleich
+        if "Bitte Modelle" in ckpt_name and create_checkpoints_folder == True:
             # Externe Festplatten erneut finden
             external_drives = self.__class__.find_external_drives()
             created_folders = []
@@ -150,23 +162,26 @@ class ExternalCheckpointLoader:
                 vae = VAE()
                 return (model, clip, vae)
         
-        # Wenn keine Modelle gefunden wurden und kein Ordner erstellt werden soll
-        if "Keine Modelle gefunden" in ckpt_name:
-            # Extrahiere die fehlenden Laufwerke aus der Auswahl für bessere Fehlermeldung
-            error_msg = "Keine Modelle gefunden. Bitte erstellen Sie den Ordner 'checkpoints' auf Ihrem externen Laufwerk und kopieren Sie dort Ihre .safetensors oder .ckpt Dateien hinein."
+        # Wenn keine Modelle gefunden wurden
+        if "Bitte Modelle" in ckpt_name:
+            # Unterscheide zwischen "Ordner fehlt" und "Ordner ist leer"
+            error_msg = "Keine Modelle gefunden."
             
-            # Verbesserte Extraktion der Laufwerksinformationen
-            if "(" in ckpt_name and ")" in ckpt_name:
-                # Extrahiere den Text zwischen den Klammern
-                try:
-                    drives_info = ckpt_name.split("(")[1].split(")")[0]
-                    if drives_info:
-                        error_msg += f"\n\nBetroffene Laufwerke: {drives_info}"
-                except:
-                    pass
+            # Wenn wir wissen, dass es Laufwerke ohne Checkpoints-Ordner gibt
+            if hasattr(self.__class__, 'drives_without_folders') and self.__class__.drives_without_folders:
+                missing_drives = ", ".join(self.__class__.drives_without_folders)
+                error_msg += f"\n\nAuf folgenden Laufwerken fehlt der 'checkpoints' Ordner: {missing_drives}"
                 
-            # Hinweis zum Button hinzufügen
-            error_msg += "\n\nALTERNATIV: Aktivieren Sie die Option 'Checkpoints-Ordner erstellen' und führen Sie diesen Knoten erneut aus."
+                # Zeige an, wie der Benutzer den Ordner erstellen kann
+                if create_checkpoints_folder is False:  # Nur wenn der Button nicht aktiv ist
+                    error_msg += "\n\nOption 1: Aktivieren Sie 'Checkpoints-Ordner erstellen' und führen Sie diesen Knoten erneut aus."
+                    
+                error_msg += "\nOption 2: Erstellen Sie manuell einen 'checkpoints' Ordner auf Ihrem externen Laufwerk."
+                error_msg += "\nOption 3: Kopieren Sie Ihre .safetensors oder .ckpt Dateien in einen vorhandenen 'checkpoints' Ordner."
+                
+            else:
+                # Wenn es Ordner gibt, die aber leer sind
+                error_msg += " Bitte kopieren Sie Ihre .safetensors oder .ckpt Dateien in den vorhandenen 'checkpoints' Ordner."
             
             raise ValueError(error_msg)
         
