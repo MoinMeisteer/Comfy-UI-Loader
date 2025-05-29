@@ -8,3 +8,4 @@ MacOS Applications/Comflowy dann in der suche ComfyUi eingeben dort in denn Ordn
 die festplatte wird Automatisch erkannt und nach denn Ordnern überprüft sollte der ordner nicht Verfügbar sein dann werden diese Generiert. Die werden Checkpoints einfach Rein kopieren.
 
 
+brew install ffmpeg, pip install audiocraft

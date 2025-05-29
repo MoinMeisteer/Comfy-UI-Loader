@@ -5,6 +5,7 @@ import comfy
 import shutil
 import importlib
 
+
 def add_temp_path(folder_type, temp_path):
     """Fügt einen temporären Pfad zu folder_paths hinzu, ohne Abhängigkeit von API-Änderungen."""
     try:
@@ -646,9 +647,6 @@ class ExternalLoRALoader:
             "optional": {
                 "model": ("MODEL",),
                 "clip": ("CLIP",),
-                "width": ("INT", {"default": 512, "min": 64, "max": 8192, "step": 8}),
-                "height": ("INT", {"default": 512, "min": 64, "max": 8192, "step": 8}),
-                "batch_size": ("INT", {"default": 1, "min": 1, "max": 64, "step": 1})
             }
         }
     
@@ -703,10 +701,10 @@ class ExternalLoRALoader:
         
         return None
 
-    def load_lora(self, lora_name, strength_model, strength_clip, model=None, clip=None, width=512, height=512, batch_size=1):
-        """Verbesserte Version der LoRA-Ladefunktion, die konsistente Ergebnisse liefert."""
+    def load_lora(self, lora_name, strength_model, strength_clip, model=None, clip=None):
+        """Verbesserte LoRA-Ladefunktion mit Kompatibilität für verschiedene ComfyUI-Versionen."""
         
-        # Initialisiere das Cache-System, falls noch nicht geschehen
+        # Initialisiere das Cache-System
         if not hasattr(self.__class__, 'cache_dir'):
             self.__class__.setup_lora_cache()
         
@@ -727,165 +725,246 @@ class ExternalLoRALoader:
                 raise ValueError(f"LoRA-Pfad für {lora_name} konnte nicht gefunden werden.")
                     
             lora_path = os.path.join(drive_path, filename)
-            print(f"Lade LoRA von externem Laufwerk: {lora_path}")
+            print(f"Lade LoRA von: {lora_path}")
             
             # Im Hintergrund cachen für zukünftige Verwendung
             try:
                 self.cache_lora(lora_name)
             except Exception as e:
-                print(f"Caching für zukünftige Verwendung fehlgeschlagen: {e}")
+                print(f"Caching fehlgeschlagen (nicht kritisch): {e}")
         
-        # Prüfe, ob die Datei existiert
+        # Wichtig: Detaillierte Dateiprüfung
         if not os.path.exists(lora_path):
             raise ValueError(f"LoRA-Datei existiert nicht: {lora_path}")
         
-        # Prüfe Dateigröße
         try:
             file_size = os.path.getsize(lora_path)
             print(f"LoRA Dateigröße: {file_size/1024/1024:.2f} MB")
-            if file_size < 1000:
-                print(f"Warnung: LoRA-Datei könnte zu klein sein ({file_size} bytes)")
+            if file_size < 10000:  # Warnung wenn Datei sehr klein ist
+                print(f"WARNUNG: LoRA-Datei ist sehr klein ({file_size} bytes), könnte beschädigt sein")
         except Exception as e:
             print(f"Konnte Dateigröße nicht prüfen: {str(e)}")
         
         # Erstelle leere Modelle falls nötig
         if model is None or clip is None:
             import torch
-            from comfy import model_management
+            from comfy import sd
             
+            print("Erstelle leere Modelle für alleinstehende LoRA-Anwendung")
             if model is None:
-                try:
-                    # Versuche ein leeres base-Modell zu laden
-                    from comfy import sd
-                    if hasattr(sd, 'load_model_weights_empty'):
-                        model = sd.load_model_weights_empty(width, height, 1)
-                        print("Leeres Modell mit ComfyUI-API erstellt")
-                    else:
-                        # Fallback auf eigene Implementierung
-                        class EmptyModel:
-                            def __init__(self):
-                                self.model = torch.nn.Module()
-                                self.model_config = {
-                                    "model": {"target": "ldm.models.diffusion.ddpm.LatentDiffusion"}, 
-                                    "image_size": [height, width]
-                                }
-                                self.is_empty = True
-                                self.model_name = "empty_model"
-                                self.model_type = None
-                        model = EmptyModel()
-                        print("Leeres Modell mit eigener Implementierung erstellt")
-                except Exception as e:
-                    print(f"Fehler beim Erstellen des leeren Modells: {str(e)}")
-                    # Minimalistisches Fallback-Modell
-                    class MinimalModel:
-                        def __init__(self): self.model = torch.nn.Module()
-                    model = MinimalModel()
-            
+                model = sd.load_model_weights_empty(512, 512, 1)
             if clip is None:
-                try:
-                    # Versuche einen leeren CLIP zu laden
-                    from comfy import sd
-                    if hasattr(sd, 'load_clip_weights_empty'):
-                        clip = sd.load_clip_weights_empty(width, height, batch_size)
-                        print("Leerer CLIP mit ComfyUI-API erstellt")
-                    else:
-                        # Fallback auf eigene Implementierung
-                        class EmptyCLIP:
-                            def __init__(self):
-                                self.cond_stage_model = torch.nn.Module()
-                                self.clip_layer = "last"
-                                self.is_empty = True
-                                self.patcher = None
-                                self.tokenizer = None
-                        clip = EmptyCLIP()
-                        print("Leerer CLIP mit eigener Implementierung erstellt")
-                except Exception as e:
-                    print(f"Fehler beim Erstellen des leeren CLIPs: {str(e)}")
-                    # Minimalistisches Fallback-CLIP
-                    class MinimalCLIP:
-                        def __init__(self): self.cond_stage_model = torch.nn.Module()
-                    clip = MinimalCLIP()
-        
-        # WICHTIG: Verwende den Standard-LoRA-Loader direkt
+                clip = sd.load_clip_weights_empty(512, 512, 1)
+
+        # METHODE 1: Verwende lora.load_lora_weights mit richtigen Parametern
         try:
-            # Importiere den Standard-LoRA-Loader
-            from nodes import LoraLoader
-            loader = LoraLoader()
+            from comfy import lora
+            from safetensors.torch import load_file
+            from comfy.utils import load_torch_file
             
-            # Methode 1: Lora-Ordner temporär hinzufügen
-            lora_dir = os.path.dirname(lora_path)
-            orig_paths = folder_paths.get_folder_paths("loras")
+            print(f"Lade LoRA mit korrigierter Methode: {lora_path}")
             
-            success = False
+            # Wähle die richtige Ladefunktion basierend auf der Dateiendung
+            if lora_path.endswith(".safetensors"):
+                print("Lade safetensors-Format...")
+                lora_state_dict = load_file(lora_path)
+            else:
+                print("Lade pytorch-Format...")
+                lora_state_dict = load_torch_file(lora_path)
+                
+            # Prüfe, welche lora.load_* Funktionen verfügbar sind und welche Parameter sie akzeptieren
+            import inspect
+            
+            if hasattr(lora, 'load_lora_for_models'):
+                print("Verwende load_lora_for_models Funktion")
+                model_lora, clip_lora = lora.load_lora_for_models(model, clip, lora_state_dict, strength_model, strength_clip)
+            elif hasattr(lora, 'load_lora'):
+                sig = inspect.signature(lora.load_lora)
+                param_count = len(sig.parameters)
+                print(f"load_lora hat {param_count} Parameter")
+                
+                if param_count >= 5:  # Neuere Versionen akzeptieren alle Parameter
+                    model_lora, clip_lora = lora.load_lora(model, clip, lora_state_dict, strength_model, strength_clip)
+                elif param_count == 3:  # Einige Versionen erwarten lora_state_dict als dritten Parameter
+                    try:
+                        # In manchen 3-Parameter-Versionen können die Parameter anders angeordnet sein
+                        # Versuche zunächst den Ansatz mit model, clip, lora_state_dict
+                        print("Versuche load_lora mit model, clip, state_dict")
+                        
+                        # Prüfe, ob clip ein iterierbares Objekt sein sollte
+                        if hasattr(lora, 'load_lora'):
+                            sig = inspect.signature(lora.load_lora)
+                            param_names = list(sig.parameters.keys())
+                            print(f"Parameter-Namen: {param_names}")
+                            
+                            # Die richtige Art und Reihenfolge bestimmen
+                            if 'to_load' in param_names:
+                                print("Verwende load_lora mit korrekter Parameterreihenfolge")
+                                # In dieser Version erwartet lora.load_lora lora_dict, model, strength
+                                model_lora = model.clone() if hasattr(model, 'clone') else model
+                                clip_lora = clip.clone() if hasattr(clip, 'clone') else clip
+                                
+                                # Versuche den manuellen Patch-Ansatz stattdessen
+                                if hasattr(model_lora, 'add_patches'):
+                                    print("Verwende add_patches für Model")
+                                    model_lora.add_patches(lora_state_dict, strength_model)
+                                
+                                if hasattr(clip_lora, 'add_patches'):
+                                    print("Verwende add_patches für CLIP")
+                                    clip_lora.add_patches(lora_state_dict, strength_clip)
+                                
+                                # Alternative: Direktes patchen mit der apply_lora Methode wenn vorhanden
+                                elif hasattr(lora, 'apply_lora'):
+                                    print("Verwende apply_lora Methode")
+                                    lora.apply_lora(model_lora, lora_state_dict, strength_model)
+                                    lora.apply_lora(clip_lora, lora_state_dict, strength_clip)
+                                
+                                return (model_lora, clip_lora)
+                            else:
+                                # Versuchen wir den ursprünglichen Ansatz
+                                model_lora, clip_lora = lora.load_lora(model, clip, lora_state_dict)
+                        
+                        # Stärken müssen separat angewendet werden
+                        if hasattr(model_lora, 'set_lora_strength'):
+                            model_lora.set_lora_strength(strength_model)
+                        if hasattr(clip_lora, 'set_lora_strength'):
+                            clip_lora.set_lora_strength(strength_clip)
+                            
+                    except TypeError as e:
+                        print(f"TypeError bei 3-Parameter-Aufruf: {e}")
+                        print("Versuche alternativen LoRA-Anwendungsansatz")
+                        
+                        # Versuche direkt auf das Modell und CLIP anzuwenden
+                        model_lora = model.clone() if hasattr(model, 'clone') else model
+                        clip_lora = clip.clone() if hasattr(clip, 'clone') else clip
+                        
+                        # Direktes Anwenden mit Patchern falls vorhanden
+                        if hasattr(model_lora, 'add_patches'):
+                            model_lora.add_patches(lora_state_dict, strength_model)
+                        if hasattr(clip_lora, 'add_patches'):
+                            clip_lora.add_patches(lora_state_dict, strength_clip)
+                            
+                        return (model_lora, clip_lora)
+                    except Exception as e:
+                        print(f"Fehler beim Anwenden des LoRA mit 3-Parameter-Ansatz: {e}")
+                        raise e
+                
+            print("LoRA erfolgreich angewendet")
+            return (model_lora, clip_lora)
+    
+        except Exception as e:
+            print(f"Fehler beim direkten Laden der LoRA: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            
+            # METHODE 2: Versuche mit dem Standard LoraLoader
             try:
-                # Versuche den temporären Pfad hinzuzufügen
-                if add_temp_path("loras", lora_dir):
-                    # Rufe den Standard-Loader mit dem Dateinamen auf
-                    print(f"Rufe Standard-LoraLoader.load_lora mit Dateinamen: {filename} auf")
-                    print(f"Strength Model: {strength_model}, Strength CLIP: {strength_clip}")
-                    result = loader.load_lora(filename, strength_model, strength_clip, model, clip)
-                    success = True
-                    return result
-            except Exception as e1:
-                print(f"Fehler bei Methode 1: {str(e1)}")
-            
-            # Methode 2: Kopieren in temporären Ordner im standard loras folder
-            if not success:
+                from nodes import LoraLoader
+                loader = LoraLoader()
+                print("Versuche Standard LoraLoader als Fallback...")
+                
+                # Kopiere die Datei in den Standard-LoRA-Ordner
+                lora_dirs = folder_paths.get_folder_paths("loras")
+                if not lora_dirs:
+                    raise ValueError("Keine Standard-LoRA-Ordner gefunden")
+                
+                base_filename = os.path.basename(lora_path)
+                tmp_file = os.path.join(lora_dirs[0], f"tmp_{base_filename}")
+                print(f"Kopiere {lora_path} nach {tmp_file}")
+                
+                shutil.copy2(lora_path, tmp_file)
                 try:
-                    default_lora_paths = folder_paths.get_folder_paths("loras")
-                    if default_lora_paths:
-                        default_lora_dir = default_lora_paths[0]
-                        temp_file = os.path.join(default_lora_dir, f"temp_{filename}")
-                        
-                        # Kopiere die Datei temporär
-                        print(f"Kopiere LoRA nach: {temp_file}")
-                        shutil.copy2(lora_path, temp_file)
-                        
+                    tmp_filename = os.path.basename(tmp_file)
+                    print(f"Rufe Standard-LoraLoader.load_lora mit {tmp_filename} auf")
+                    
+                    import inspect
+                    sig = inspect.signature(loader.load_lora)
+                    param_names = list(sig.parameters.keys())
+                    param_count = len(param_names)
+                    
+                    print(f"LoraLoader.load_lora hat {param_count} Parameter: {param_names}")
+                    
+                    # KRITISCHE KORREKTUR: Verwenden Sie die korrekte Parameterreihenfolge
+                    if "model" in param_names and "clip" in param_names and "lora_name" in param_names:
+                        # Die Parameter sind in der Reihenfolge model, clip, lora_name, strength_model, strength_clip
+                        print("Verwende korrigierte Parameterreihenfolge")
+                        result = loader.load_lora(
+                            model,                 # model
+                            clip,                  # clip
+                            str(tmp_filename),     # lora_name als String
+                            float(strength_model), # strength_model als Float
+                            float(strength_clip)   # strength_clip als Float
+                        )
+                        return result
+                    elif param_count == 5:
+                        # Fallback zu anderen möglichen Ordnungen, erst mit lora_name
                         try:
-                            # Lade die LoRA mit dem Standard-Loader
-                            print(f"Lade LoRA aus Standard-Ordner: {os.path.basename(temp_file)}")
-                            result = loader.load_lora(os.path.basename(temp_file), strength_model, strength_clip, model, clip)
-                            
-                            # Lösche die temporäre Datei
-                            if os.path.exists(temp_file):
-                                os.remove(temp_file)
-                            
+                            print("Versuche alternative Parameterreihenfolge (lora_name zuerst)")
+                            result = loader.load_lora(
+                                str(tmp_filename),     # lora_name
+                                float(strength_model), # strength_model
+                                float(strength_clip),  # strength_clip
+                                model,                 # model
+                                clip                   # clip
+                            )
                             return result
-                        except Exception as e2:
-                            print(f"Fehler beim Laden aus Standard-Ordner: {str(e2)}")
-                            # Lösche die temporäre Datei bei Fehler
-                            if os.path.exists(temp_file):
-                                os.remove(temp_file)
-                except Exception as e3:
-                    print(f"Fehler bei Methode 2: {str(e3)}")
+                        except Exception as e:
+                            print(f"Alternative Reihenfolge 1 fehlgeschlagen: {str(e)}")
+                    
+                    # Wenn nichts funktioniert, versuche die native Methode mit manuell geladenen Weights
+                    print("Versuche manuelles Laden der LoRA-Gewichte")
+                    if tmp_file.endswith(".safetensors"):
+                        from safetensors.torch import load_file
+                        lora_state_dict = load_file(tmp_file)
+                    else:
+                        import torch
+                        lora_state_dict = torch.load(tmp_file, map_location="cpu")
+                    
+                    # Ältere Versionen von ComfyUI verwenden eine andere API für LoRA
+                    try:
+                        from comfy import lora as comfy_lora
+                        model_lora = model
+                        clip_lora = clip
+                        
+                        # Durchlaufe alle Schlüssel im LoRA-Wörterbuch
+                        a_tensors = {}
+                        b_tensors = {}
+                        
+                        # Importiere die Patcher Klasse
+                        try:
+                            from comfy.lora import LoRAPatches
+                            # Manuell patchen
+                            if hasattr(model, 'lora_forward'):  # Direkte Anwendung des LoRA
+                                print("Manuelles Patchen mit model.lora_forward")
+                                model_lora = model.clone()
+                                model_lora.lora_forward(lora_state_dict, float(strength_model))
+                                
+                            if hasattr(clip, 'lora_forward'):
+                                print("Manuelles Patchen mit clip.lora_forward")
+                                clip_lora = clip.clone()
+                                clip_lora.lora_forward(lora_state_dict, float(strength_clip))
+                                
+                            return (model_lora, clip_lora)
+                        except Exception as e:
+                            print(f"Manuelles Patchen fehlgeschlagen: {str(e)}")
+                    except Exception as e:
+                        print(f"Natives Laden fehlgeschlagen: {str(e)}")
+                    
+                    # Als letzten Ausweg, gib die unveränderten Modelle zurück
+                    print("Alle Versuche fehlgeschlagen, gebe unveränderte Modelle zurück")
+                    return (model, clip)
+                finally:
+                    # Lösche die temporäre Datei
+                    if os.path.exists(tmp_file):
+                        os.remove(tmp_file)
+                        print("Temporäre Datei gelöscht")
             
-            # Methode 3: Direktes Laden mit safetensors oder torch
-            print("Versuche LoRA direkt zu laden...")
-            try:
-                from safetensors.torch import load_file
-                import torch
-                from comfy.utils import load_torch_file
-                
-                print(f"Lade LoRA-Gewichte aus: {lora_path}")
-                if lora_path.endswith(".safetensors"):
-                    lora_state_dict = load_file(lora_path)
-                else:
-                    lora_state_dict = load_torch_file(lora_path)
-                
-                from comfy import lora
-                
-                # Dies verwendet die interne ComfyUI-LoRA-Funktionalität
-                print(f"Wende LoRA mit der offziellen API an: Stärken {strength_model}, {strength_clip}")
-                model_lora, clip_lora = lora.load_lora(model, clip, lora_state_dict, strength_model, strength_clip)
-                return (model_lora, clip_lora)
-            except Exception as e4:
-                print(f"Alle Lademethoden fehlgeschlagen: {str(e4)}")
-                
-        except Exception as e_outer:
-            print(f"Fehler im LoRA-Ladevorgang: {str(e_outer)}")
+            except Exception as e2:
+                print(f"Auch der Standard-LoraLoader ist fehlgeschlagen: {str(e2)}")
+                traceback.print_exc()
         
-        # Letzter Ausweg: Gib die unveränderten Modelle zurück
-        print("Verwende Originalmodelle, da LoRA nicht geladen werden konnte")
+        # Wenn alle Methoden fehlschlagen, gib die unveränderten Modelle zurück
+        print("LoRA konnte nicht angewendet werden, gebe unveränderte Modelle zurück")
         return (model, clip)
         
     def load_lora_direct(self, file_path, strength_model, strength_clip, model, clip):
